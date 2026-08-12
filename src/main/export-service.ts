@@ -1,7 +1,9 @@
 import { app, BrowserWindow, nativeImage, shell } from 'electron'
 import { createHash } from 'crypto'
+import { once } from 'events'
 import { createReadStream, createWriteStream, promises as fs } from 'fs'
 import { extname, join } from 'path'
+import { finished } from 'stream/promises'
 import { fileURLToPath } from 'url'
 import { ZipArchive, type Archiver } from 'archiver'
 import * as chat from './services/chat-service'
@@ -629,27 +631,60 @@ const kindOf = (message: Message): ExportMessageKind => {
 }
 const csv = (value: unknown): string => `"${String(value ?? '').replace(/"/g, '""')}"`
 
+const renderCsvMessage = (message: Message): string =>
+  [
+    message.datetime,
+    message.name || (message.isSender ? '我' : '联系人'),
+    message.type,
+    message.content,
+    message.exportMediaUrl || message.voiceDataUrl || '',
+    message.exportMediaError || ''
+  ]
+    .map(csv)
+    .join(',')
+
+async function writeCsv(
+  outputPath: string,
+  messages: readonly Message[],
+  isCancelled: () => boolean
+): Promise<void> {
+  const temporaryPath = `${outputPath}.tmp-${process.pid}-${Date.now()}`
+  const output = createWriteStream(temporaryPath, { encoding: 'utf8' })
+  const completion = finished(output)
+  const write = async (value: string): Promise<void> => {
+    if (!output.write(value)) await once(output, 'drain')
+  }
+
+  try {
+    await once(output, 'open')
+    await write('时间,发送者,类型,内容,媒体路径,媒体状态')
+    for (const message of messages) {
+      if (isCancelled()) throw new Error('已取消')
+      await write(`\n${renderCsvMessage(message)}`)
+    }
+    output.end()
+    await completion
+    try {
+      await fs.rename(temporaryPath, outputPath)
+    } catch (error) {
+      if (!['EEXIST', 'EPERM'].includes((error as NodeJS.ErrnoException).code || '')) throw error
+      await fs.rm(outputPath, { force: true })
+      await fs.rename(temporaryPath, outputPath)
+    }
+  } finally {
+    if (!output.destroyed) output.destroy()
+    await completion.catch(() => undefined)
+    await fs.rm(temporaryPath, { force: true })
+  }
+}
+
 function render(format: ExportRequest['format'], messages: Message[], name: string): string {
   if (format === 'html') return renderExportPage(name)
   if (format === 'json')
     return JSON.stringify({ name, exportedAt: new Date().toISOString(), messages }, null, 2)
   if (format === 'markdown')
     return `# ${name}\n\n${messages.map((m) => `**${m.name || (m.isSender ? '我' : '联系人')}** · ${m.datetime}\n\n${m.content || `[${m.type}]`}${m.exportMediaUrl || m.voiceDataUrl || m.exportMediaError ? `\n\n媒体：${m.exportMediaUrl || m.voiceDataUrl || m.exportMediaError}` : ''}\n`).join('\n')}`
-  return [
-    '时间,发送者,类型,内容,媒体路径,媒体状态',
-    ...messages.map((m) =>
-      [
-        m.datetime,
-        m.name || (m.isSender ? '我' : '联系人'),
-        m.type,
-        m.content,
-        m.exportMediaUrl || m.voiceDataUrl || '',
-        m.exportMediaError || ''
-      ]
-        .map(csv)
-        .join(',')
-    )
-  ].join('\n')
+  return ['时间,发送者,类型,内容,媒体路径,媒体状态', ...messages.map(renderCsvMessage)].join('\n')
 }
 
 interface SingleExportOptions {
@@ -796,7 +831,11 @@ async function runSingleExport(
         target.type === 'group' &&
         (request.scope === 'all' || !Object.keys(target.nameMap || {}).length)
       ) {
+        const snapshotStartedAt = Date.now()
         const snapshot = await chat.getGroupSnapshotAsync(target.userMd5)
+        console.log(
+          `[Export] group snapshot ${target.userMd5} members=${snapshot?.members.length || 0} cost=${Date.now() - snapshotStartedAt}ms`
+        )
         for (const member of snapshot?.members || []) {
           target.nameMap![member.wxid] = resolveMemberName(
             {
@@ -841,6 +880,7 @@ async function runSingleExport(
         return left.messageOrder - right.messageOrder
       })
       .map((entry) => entry.message)
+    messageEntries.length = 0
     const selfInfo =
       options.selfInfo !== undefined
         ? options.selfInfo
@@ -1474,7 +1514,11 @@ async function runSingleExport(
         percent: 90
       })
     }
-    await fs.writeFile(outputPath, render(request.format, messages, archiveName), 'utf8')
+    if (request.format === 'csv') {
+      await writeCsv(outputPath, messages, () => !jobs.has(request.jobId))
+    } else {
+      await fs.writeFile(outputPath, render(request.format, messages, archiveName), 'utf8')
+    }
     send({
       jobId: request.jobId,
       phase: 'completed',

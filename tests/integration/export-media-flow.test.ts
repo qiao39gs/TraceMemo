@@ -1094,6 +1094,39 @@ describe('media export flow', () => {
     expect(existsSync(join(outputDir, 'index.html'))).toBe(false)
   })
 
+  it('streams CSV with the existing escaping and line-ending format', async () => {
+    const { runExport } = await import('../../src/main/export-service')
+    const win = {
+      isDestroyed: () => false,
+      webContents: { send: vi.fn() }
+    }
+    state.messages = [
+      message({
+        id: 'csv-escaped',
+        content: '第一行,"你好"\n第二行'
+      })
+    ]
+
+    const result = await runExport(
+      {
+        jobId: 'streamed-csv',
+        scope: 'selected',
+        targets: [target('csv-escaped-user', 'CSV 转义')],
+        format: 'csv',
+        outputName: 'CSV 转义',
+        kinds: ['text'],
+        includeMedia: false
+      },
+      win as never
+    )
+
+    expect(result.success, result.error).toBe(true)
+    expect(readFileSync(result.outputPath!, 'utf8')).toBe(
+      '时间,发送者,类型,内容,媒体路径,媒体状态\n' +
+        '"2026-08-01 10:00:00","CSV 转义","普通文本","第一行,""你好""\n第二行","",""'
+    )
+  })
+
   it('cancels an all-export task between conversations without starting the next database read', async () => {
     const { cancelExport, runExport } = await import('../../src/main/export-service')
     const jobId = 'all-export-cancel'

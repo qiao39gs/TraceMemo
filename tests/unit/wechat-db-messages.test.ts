@@ -18,7 +18,7 @@ describe('WechatDb normalized messages', () => {
         senderNickname: ''
       }
     }
-    const client = { getMessagesAsync: vi.fn(async () => [normalized]) }
+    const client = { getMessagesForExportAsync: vi.fn(async () => [normalized]) }
     const db = Object.assign(Object.create(WechatDb.prototype), {
       wcdb4Client: client,
       chatMd5ToUsername: new Map([['fixture-md5', 'fixture-user']]),
@@ -36,7 +36,7 @@ describe('WechatDb normalized messages', () => {
     })
   })
 
-  it('scans without time bounds, then filters, deduplicates and sorts in application code', async () => {
+  it('pushes time bounds down, then filters, deduplicates and sorts defensively', async () => {
     const row = (id: string, createTime: number): WechatMessage => ({
       mesLocalID: id,
       serverId: `server-${id}`,
@@ -49,7 +49,7 @@ describe('WechatDb normalized messages', () => {
     const start = Math.floor(new Date(2025, 0, 1).getTime() / 1000)
     const end = Math.floor(new Date(2025, 0, 4).getTime() / 1000)
     const shardBoundaryMessage = row('jan-2-boundary', start + 32 * 60 * 60)
-    const getMessagesAsync = vi.fn(async () => [
+    const getMessagesForExportAsync = vi.fn(async () => [
       row('before-range', start - 1),
       row('newest', start + 48 * 60 * 60),
       shardBoundaryMessage,
@@ -57,15 +57,15 @@ describe('WechatDb normalized messages', () => {
       row('after-range', end + 1)
     ])
     const db = Object.assign(Object.create(WechatDb.prototype), {
-      wcdb4Client: { getMessagesAsync },
+      wcdb4Client: { getMessagesForExportAsync },
       chatMd5ToUsername: new Map([['fixture-md5', 'fixture-user']]),
       ensureChatTableMapping: vi.fn()
     }) as WechatDb
 
     const messages = await db.getUserMessagesForExport('fixture-md5', start, end)
 
-    expect(getMessagesAsync).toHaveBeenCalledOnce()
-    expect(getMessagesAsync).toHaveBeenCalledWith('fixture-user')
+    expect(getMessagesForExportAsync).toHaveBeenCalledOnce()
+    expect(getMessagesForExportAsync).toHaveBeenCalledWith('fixture-user', start, end)
     expect(messages.map((message) => message.mesLocalID)).toEqual(['jan-2-boundary', 'newest'])
   })
 })

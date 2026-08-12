@@ -1,0 +1,11 @@
+onlyBuiltDependencies:
+  - electron
+  - esbuild
+  - ffmpeg-static
+supportedArchitectures:
+  os:
+    - current
+    - win32
+  cpu:
+    - current
+    - x64

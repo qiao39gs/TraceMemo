@@ -465,6 +465,7 @@ export async function listMessagesForExport(
   if (!dbRef) return []
   const rawMessages = await dbRef.getUserMessagesForExport(userMd5, startTime, endTime)
   const sourceMessages = listSourceMessages(userMd5, startTime, endTime, undefined, rawMessages)
+  rawMessages.length = 0
   const username = dbRef.getWcdb4Client().getUsernameByMd5(userMd5) || ''
   recordRecallArchiveMessages(userMd5, username, sourceMessages)
   const mergedMessages = mergeRecallArchiveMessages(userMd5, sourceMessages, startTime, endTime)

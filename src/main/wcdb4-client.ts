@@ -6,6 +6,10 @@ import { createRequire } from 'module'
 import { createConnection, Socket } from 'net'
 import { getResourceRoots } from './resource-paths'
 
+const MESSAGE_STORE_CACHE_TTL_MS = 120_000
+const EXPORT_SCAN_CONCURRENCY = 8
+const GROUP_MEMBERS_CACHE_TTL_MS = 120_000
+
 export interface Wcdb4Session {
   username: string
   nickname: string
@@ -339,6 +343,8 @@ export class Wcdb4Client {
   private sessionStatusesInFlight: Promise<void> | null = null
   private sessionStatusesUpdatedAt = 0
   private sessionCacheGeneration = 0
+  private messageStoreCache: { at: number; stores: Map<string, Wcdb4MessageStore[]> } | null = null
+  private groupMembersCache: { at: number; members: Map<string, Wcdb4GroupMember[]> } | null = null
   private closing = false
   private nativeCallsInFlight = new Set<Promise<unknown>>()
 
@@ -1083,6 +1089,7 @@ export class Wcdb4Client {
   ): Promise<Wcdb4Message[]> {
     const startedAt = Date.now()
     const maxRows = this.normalizeMessageLimit(options.limit)
+    const hasTimeBounds = Boolean(startTime || endTime)
     let cursorMessages: Wcdb4Message[] = []
     try {
       cursorMessages = await this.getMessagesByCursorAsync(username, startTime, endTime, maxRows)
@@ -1090,7 +1097,7 @@ export class Wcdb4Client {
       console.warn(`[WCDB4] async cursor messages failed username=${username}:`, error)
     }
 
-    if (endTime && (!this.wcdbGetMessageTableStats || !this.wcdbExecQuery)) {
+    if (hasTimeBounds && (!this.wcdbGetMessageTableStats || !this.wcdbExecQuery)) {
       throw new Error('当前数据服务无法检查历史消息分片，请更新应用或核对微信数据版本')
     }
 
@@ -1098,7 +1105,7 @@ export class Wcdb4Client {
     // enumerate. A bounded query must inspect all matching stores so history
     // cannot silently stop at a shard boundary.
     let tableMessages: Wcdb4Message[] = []
-    if (endTime || cursorMessages.length === 0) {
+    if (hasTimeBounds || cursorMessages.length === 0) {
       tableMessages = await this.getMessagesByTableScanAsync(username, startTime, endTime, maxRows)
     }
     const messages = this.mergeMessageRows(cursorMessages, tableMessages, maxRows)
@@ -1106,6 +1113,123 @@ export class Wcdb4Client {
       `[WCDB4] getMessages async username=${username} rows=${messages.length} cursor=${cursorMessages.length} tables=${tableMessages.length} cost=${Date.now() - startedAt}ms`
     )
     return messages
+  }
+
+  private async getMessageStoresCachedAsync(username: string): Promise<Wcdb4MessageStore[]> {
+    const now = Date.now()
+    const cache = this.messageStoreCache
+    if (cache && now - cache.at < MESSAGE_STORE_CACHE_TTL_MS) {
+      const hit = cache.stores.get(username)
+      if (hit) return hit
+    }
+    const stores = await this.listMessageStoresAsync(username)
+    const current =
+      cache && now - cache.at < MESSAGE_STORE_CACHE_TTL_MS
+        ? cache
+        : { at: now, stores: new Map<string, Wcdb4MessageStore[]>() }
+    current.stores.set(username, stores)
+    this.messageStoreCache = current
+    return stores
+  }
+
+  /**
+   * Export-specific read path. The native bounded cursor can take tens of
+   * seconds to open, while a bounded table scan over every message store is
+   * at least as complete and much cheaper. The cursor is only consulted as a
+   * fallback when a store holds more than one scan page of matching rows.
+   */
+  async getMessagesForExportAsync(
+    username: string,
+    startTime?: number,
+    endTime?: number
+  ): Promise<Wcdb4Message[]> {
+    const startedAt = Date.now()
+    if (!this.wcdbExecQuery || !this.wcdbGetMessageTableStats) {
+      return this.getMessagesAsync(username, startTime, endTime)
+    }
+
+    let stores: Wcdb4MessageStore[]
+    try {
+      stores = await this.getMessageStoresCachedAsync(username)
+    } catch (error) {
+      console.warn(`[WCDB4] export store stats failed username=${username}:`, error)
+      return this.getMessagesAsync(username, startTime, endTime)
+    }
+
+    const begin = this.normalizeTimestamp(startTime || 0)
+    const end = this.normalizeTimestamp(endTime || 0)
+    const where = [
+      begin > 0 ? `"create_time" >= ${begin}` : '',
+      end > 0 ? `"create_time" <= ${end}` : ''
+    ].filter(Boolean)
+    const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : ''
+
+    const allRows: Record<string, unknown>[] = []
+    let successfulTables = 0
+    let incomplete = false
+    const pageSize = 5000
+    const scanStore = async (table: Wcdb4MessageStore): Promise<void> => {
+      try {
+        let offset = 0
+        while (true) {
+          const sql = `SELECT * FROM ${this.quoteSqlIdentifier(table.tableName)}${whereSql} ORDER BY "create_time" ASC LIMIT ${pageSize} OFFSET ${offset}`
+          const rows = await this.callJsonAsync<Record<string, unknown>[]>(
+            this.wcdbExecQuery as unknown as KoffiAsyncFunction,
+            'message',
+            table.dbPath,
+            sql
+          )
+          const batch = Array.isArray(rows) ? rows : []
+          allRows.push(...batch)
+          if (batch.length < pageSize) break
+          incomplete = true
+          offset += pageSize
+        }
+        successfulTables += 1
+      } catch (error) {
+        console.warn(
+          `[WCDB4] export table scan failed username=${username} db=${table.dbPath} table=${table.tableName}:`,
+          error
+        )
+      }
+    }
+    await this.runWithConcurrency(stores, EXPORT_SCAN_CONCURRENCY, scanStore)
+
+    if (stores.length > 0 && successfulTables === 0) {
+      throw new Error('历史消息分片均读取失败，请检查数据目录或微信数据版本')
+    }
+
+    const scanned = this.finalizeMessages(username, allRows, startTime, endTime)
+    let messages = scanned
+    if (incomplete) {
+      let cursorMessages: Wcdb4Message[] = []
+      try {
+        cursorMessages = await this.getMessagesByCursorAsync(username, startTime, endTime)
+      } catch (error) {
+        console.warn(`[WCDB4] export cursor fallback failed username=${username}:`, error)
+      }
+      messages = this.mergeMessageRows(cursorMessages, scanned)
+    }
+    console.log(
+      `[WCDB4] export read done username=${username} stores=${stores.length} raw=${allRows.length} rows=${messages.length} incomplete=${incomplete} cost=${Date.now() - startedAt}ms`
+    )
+    return messages
+  }
+
+  private async runWithConcurrency<T>(
+    items: T[],
+    concurrency: number,
+    run: (item: T) => Promise<void>
+  ): Promise<void> {
+    let index = 0
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (index < items.length) {
+        const current = index
+        index += 1
+        await run(items[current])
+      }
+    })
+    await Promise.all(workers)
   }
 
   async countVoiceMessagesAsync(
@@ -1214,6 +1338,7 @@ export class Wcdb4Client {
   ): Promise<Wcdb4Message[]> {
     if (!this.wcdbExecQuery) return []
 
+    const startedAt = Date.now()
     let tables: Wcdb4MessageStore[] = []
     try {
       tables = await this.listMessageStoresAsync(username)
@@ -1236,7 +1361,9 @@ export class Wcdb4Client {
 
     const allRows: Record<string, unknown>[] = []
     let successfulTables = 0
+    const storeTimings: { store: Wcdb4MessageStore; ms: number }[] = []
     for (const table of tables) {
+      const tableStartedAt = Date.now()
       try {
         const sql = `SELECT * FROM ${this.quoteSqlIdentifier(table.tableName)}${whereSql} ORDER BY "create_time" ${order} LIMIT ${rowLimit}`
         const rows = await this.callJsonAsync<Record<string, unknown>[]>(
@@ -1253,12 +1380,16 @@ export class Wcdb4Client {
           error
         )
       }
+      storeTimings.push({ store: table, ms: Date.now() - tableStartedAt })
     }
 
     if (tables.length > 0 && successfulTables === 0) {
       throw new Error('历史消息分片均读取失败，请检查数据目录或微信数据版本')
     }
-
+    const slowest = [...storeTimings].sort((left, right) => right.ms - left.ms).slice(0, 5)
+    console.log(
+      `[WCDB4] async table scan done username=${username} stores=${tables.length} rows=${allRows.length} cost=${Date.now() - startedAt}ms slowest=${slowest.map((item) => `${item.ms}ms@${item.store.tableName}`).join(' ')}`
+    )
     return this.finalizeMessages(username, allRows, startTime, endTime, limit)
   }
 
@@ -1310,6 +1441,7 @@ export class Wcdb4Client {
   }
 
   private async listMessageStoresAsync(username: string): Promise<Wcdb4MessageStore[]> {
+    const startedAt = Date.now()
     let stores: Wcdb4MessageStore[] = []
     if (this.wcdbGetMessageTableStats) {
       try {
@@ -1322,7 +1454,11 @@ export class Wcdb4Client {
         if (!username.startsWith('gh_')) throw error
       }
     }
-    return stores.length > 0 ? stores : this.listBizMessageStoresAsync(username)
+    if (stores.length === 0) stores = await this.listBizMessageStoresAsync(username)
+    console.log(
+      `[WCDB4] message store stats username=${username} stores=${stores.length} cost=${Date.now() - startedAt}ms`
+    )
+    return stores
   }
 
   private parseMessageStores(rows: Record<string, unknown>[]): Wcdb4MessageStore[] {
@@ -1736,6 +1872,7 @@ export class Wcdb4Client {
   ): Promise<Wcdb4Message[]> {
     if (!this.wcdbOpenMessageCursor || !this.wcdbFetchMessageBatch) return []
 
+    const startedAt = Date.now()
     const handle = this.ensureHandle()
     const batchSize = limit ? Math.min(500, limit) : 1000
     const cursorOut: WcdbHandleOut = [0]
@@ -1784,11 +1921,20 @@ export class Wcdb4Client {
         // Best-effort cursor cleanup.
       }
     }
+    console.log(
+      `[WCDB4] async cursor done username=${username} rows=${allRows.length} batches=${Math.ceil(allRows.length / batchSize)} cost=${Date.now() - startedAt}ms`
+    )
     return this.finalizeMessages(username, allRows, startTime, endTime, limit)
   }
 
   async getGroupMembersAsync(chatroomId: string): Promise<Wcdb4GroupMember[]> {
     if (!this.wcdbGetGroupMembers || !chatroomId) return []
+
+    const now = Date.now()
+    const cached = this.groupMembersCache?.members.get(chatroomId)
+    if (cached && now - this.groupMembersCache!.at < GROUP_MEMBERS_CACHE_TTL_MS) {
+      return cached
+    }
 
     try {
       const groupNicknames = await this.getGroupNicknamesAsync(chatroomId)
@@ -1806,7 +1952,14 @@ export class Wcdb4Client {
         .map((member) => member.m_nsUsrName)
         .filter(Boolean)
       await this.hydrateAvatarUrlsAsync(missingAvatars)
-      return this.withCachedGroupMemberAvatars(members)
+      const hydrated = this.withCachedGroupMemberAvatars(members)
+      const cache =
+        this.groupMembersCache && now - this.groupMembersCache.at < GROUP_MEMBERS_CACHE_TTL_MS
+          ? this.groupMembersCache
+          : { at: now, members: new Map<string, Wcdb4GroupMember[]>() }
+      cache.members.set(chatroomId, hydrated)
+      this.groupMembersCache = cache
+      return hydrated
     } catch (error) {
       console.warn(`[WCDB4] async group members failed chatroom=${chatroomId}:`, error)
       return []

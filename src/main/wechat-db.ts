@@ -216,9 +216,8 @@ export class WechatDb {
     if (!username) return []
     if (startTime && endTime && startTime > endTime) return []
 
-    // A bounded native cursor can omit rows stored across a message shard boundary.
-    // Scan without bounds first, then apply the requested range in application code.
-    const rows = await this.wcdb4Client.getMessagesAsync(username)
+    // Bounded reads combine the native cursor with all matching message shards.
+    const rows = await this.wcdb4Client.getMessagesForExportAsync(username, startTime, endTime)
     const messages = rows
       .map((message) => ({ ...message.raw, ...message }))
       .filter((message) => {

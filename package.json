@@ -114,22 +114,5 @@
     "typescript": "^5.9.3",
     "vite": "^7.2.6",
     "vitest": "^4.1.10"
-  },
-  "pnpm": {
-    "supportedArchitectures": {
-      "os": [
-        "current",
-        "win32"
-      ],
-      "cpu": [
-        "current",
-        "x64"
-      ]
-    },
-    "onlyBuiltDependencies": [
-      "electron",
-      "esbuild",
-      "ffmpeg-static"
-    ]
   }
 }

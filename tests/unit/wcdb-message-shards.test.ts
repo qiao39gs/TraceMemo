@@ -62,6 +62,24 @@ describe('WCDB message shard pagination', () => {
     expect(result.map((item) => item.msgContent)).toEqual(['fixture-2017', 'fixture-2025'])
   })
 
+  it('scans all stores when only a start bound is provided', async () => {
+    const start = Math.floor(Date.UTC(2024, 0, 1) / 1000)
+    const cursor = vi.fn(async () => [message('2025', 2025)])
+    const tableScan = vi.fn(async () => [message('2024', 2024), message('2025', 2025)])
+    const client = Object.assign(Object.create(Wcdb4Client.prototype), {
+      wcdbGetMessageTableStats: vi.fn(),
+      wcdbExecQuery: vi.fn(),
+      getMessagesByCursorAsync: cursor,
+      getMessagesByTableScanAsync: tableScan
+    }) as Wcdb4Client
+
+    const result = await client.getMessagesAsync('fixture@chatroom', start)
+
+    expect(cursor).toHaveBeenCalledWith('fixture@chatroom', start, undefined, undefined)
+    expect(tableScan).toHaveBeenCalledWith('fixture@chatroom', start, undefined, undefined)
+    expect(result.map((item) => item.msgContent)).toEqual(['fixture-2024', 'fixture-2025'])
+  })
+
   it('reports an unsupported shard query instead of claiming history ended', async () => {
     const client = Object.assign(Object.create(Wcdb4Client.prototype), {
       getMessagesByCursorAsync: vi.fn(async () => [])
@@ -70,6 +88,84 @@ describe('WCDB message shard pagination', () => {
     await expect(
       client.getMessagesAsync('fixture@chatroom', undefined, 1_767_225_600, { limit: 20 })
     ).rejects.toThrow('无法检查历史消息分片')
+  })
+
+  it('scans every export store without consulting the cursor when pages are complete', async () => {
+    const store = { tableName: 'Msg_fixture', dbPath: 'db-0' }
+    const rows = [
+      { mesLocalID: '1', msgCreateTime: '1735660800', msgContent: 'fixture-a' },
+      { mesLocalID: '2', msgCreateTime: '1735747200', msgContent: 'fixture-b' }
+    ]
+    const callJsonAsync = vi.fn(async () => rows)
+    const getMessagesByCursorAsync = vi.fn()
+    const client = Object.assign(Object.create(Wcdb4Client.prototype), {
+      wcdbExecQuery: vi.fn(),
+      wcdbGetMessageTableStats: vi.fn(),
+      listMessageStoresAsync: vi.fn(async () => [store]),
+      callJsonAsync,
+      getMessagesByCursorAsync,
+      finalizeMessages: (_username: string, raw: Record<string, unknown>[]) =>
+        raw.map((row) => ({ ...row, raw: {} })) as Wcdb4Message[]
+    }) as Wcdb4Client
+
+    const result = await client.getMessagesForExportAsync(
+      'fixture@chatroom',
+      1_735_660_800,
+      1_735_747_200
+    )
+
+    expect(callJsonAsync).toHaveBeenCalledOnce()
+    const sql = String(callJsonAsync.mock.calls[0][3])
+    expect(sql).toContain('"create_time" >= 1735660800')
+    expect(sql).toContain('"create_time" <= 1735747200')
+    expect(getMessagesByCursorAsync).not.toHaveBeenCalled()
+    expect(result).toHaveLength(2)
+  })
+
+  it('consults the cursor when an export store page is full', async () => {
+    const store = { tableName: 'Msg_fixture', dbPath: 'db-0' }
+    const fullPage = Array.from({ length: 5000 }, (_, index) => ({
+      mesLocalID: String(index),
+      msgCreateTime: '1735660800',
+      msgContent: `fixture-${index}`
+    }))
+    const callJsonAsync = vi.fn().mockResolvedValueOnce(fullPage).mockResolvedValueOnce([])
+    const cursorMessage = message('cursor-only', 2025)
+    const client = Object.assign(Object.create(Wcdb4Client.prototype), {
+      wcdbExecQuery: vi.fn(),
+      wcdbGetMessageTableStats: vi.fn(),
+      listMessageStoresAsync: vi.fn(async () => [store]),
+      callJsonAsync,
+      getMessagesByCursorAsync: vi.fn(async () => [cursorMessage]),
+      finalizeMessages: (_username: string, raw: Record<string, unknown>[]) =>
+        raw.map((row) => ({ ...row, raw: {} })) as Wcdb4Message[],
+      mergeMessageRows: (_current: Wcdb4Message[], scanned: Wcdb4Message[]) => scanned
+    }) as Wcdb4Client
+
+    const result = await client.getMessagesForExportAsync('fixture@chatroom', 1_735_660_800)
+
+    expect(callJsonAsync).toHaveBeenCalledTimes(2)
+    expect(String(callJsonAsync.mock.calls[1][3])).toContain('OFFSET 5000')
+    expect(client.getMessagesByCursorAsync).toHaveBeenCalledOnce()
+    expect(result).toHaveLength(5000)
+  })
+
+  it('reuses the cached message store list for repeated exports', async () => {
+    const store = { tableName: 'Msg_fixture', dbPath: 'db-0' }
+    const listMessageStoresAsync = vi.fn(async () => [store])
+    const client = Object.assign(Object.create(Wcdb4Client.prototype), {
+      wcdbExecQuery: vi.fn(),
+      wcdbGetMessageTableStats: vi.fn(),
+      listMessageStoresAsync,
+      callJsonAsync: vi.fn(async () => []),
+      getMessagesByCursorAsync: vi.fn(),
+      finalizeMessages: () => [] as Wcdb4Message[]
+    }) as Wcdb4Client
+
+    await client.getMessagesForExportAsync('fixture@chatroom', 1_735_660_800)
+    await client.getMessagesForExportAsync('fixture@chatroom', 1_735_660_800)
+
+    expect(listMessageStoresAsync).toHaveBeenCalledOnce()
   })
 
   it('falls back to biz_message shards for official-account sessions', () => {
